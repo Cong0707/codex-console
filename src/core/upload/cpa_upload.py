@@ -8,6 +8,8 @@ from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from urllib.parse import quote
 
+from .playwright_request import PlaywrightRequestError, playwright_request
+
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
 
@@ -175,6 +177,95 @@ def upload_to_cpa(
 
         return False, _extract_cpa_error(response)
 
+    except Exception as e:
+        logger.error(f"CPA 上传异常: {e}")
+        return False, f"上传异常: {str(e)}"
+
+
+def _extract_cpa_error_from_text(status_code: int, text: str) -> str:
+    error_msg = f"上传失败: HTTP {status_code}"
+    try:
+        error_detail = json.loads(text or "")
+        if isinstance(error_detail, dict):
+            error_msg = error_detail.get("message", error_msg)
+    except Exception:
+        snippet = (text or "").strip()
+        if snippet:
+            error_msg = f"{error_msg} - {snippet[:200]}"
+    return error_msg
+
+
+def upload_to_cpa_playwright(
+    token_data: dict,
+    proxy: str = None,
+    api_url: str = None,
+    api_token: str = None,
+    browser_channel: str = "chrome",
+) -> Tuple[bool, str]:
+    """
+    上传单个账号到 CPA 管理平台（Playwright + 系统浏览器）。
+
+    Args:
+        token_data: Token JSON 数据
+        proxy: 保留参数，不使用（CPA 上传始终直连）
+        api_url: 指定 CPA API URL（优先于全局配置）
+        api_token: 指定 CPA API Token（优先于全局配置）
+        browser_channel: Playwright 浏览器通道（chrome/msedge）
+    """
+    settings = get_settings()
+
+    effective_url = api_url or settings.cpa_api_url
+    effective_token = api_token or (settings.cpa_api_token.get_secret_value() if settings.cpa_api_token else "")
+
+    if not api_url and not settings.cpa_enabled:
+        return False, "CPA 上传未启用"
+    if not effective_url:
+        return False, "CPA API URL 未配置"
+    if not effective_token:
+        return False, "CPA API Token 未配置"
+
+    upload_url = _normalize_cpa_auth_files_url(effective_url)
+    filename = f"{token_data['email']}.json"
+    file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    try:
+        status, text = playwright_request(
+            "POST",
+            upload_url,
+            headers=_build_cpa_headers(effective_token),
+            multipart={
+                "file": {
+                    "name": filename,
+                    "mimeType": "application/json",
+                    "buffer": file_content,
+                }
+            },
+            browser_channel=browser_channel,
+            headless=False,
+            timeout=30,
+        )
+
+        if status in (200, 201):
+            return True, "上传成功"
+
+        if status in (404, 405, 415):
+            logger.warning("CPA multipart 上传失败，尝试原始 JSON 回退: %s", status)
+            raw_upload_url = f"{upload_url}?name={quote(filename)}"
+            status, text = playwright_request(
+                "POST",
+                raw_upload_url,
+                headers=_build_cpa_headers(effective_token, content_type="application/json"),
+                data=file_content,
+                browser_channel=browser_channel,
+                headless=False,
+                timeout=30,
+            )
+            if status in (200, 201):
+                return True, "上传成功"
+
+        return False, _extract_cpa_error_from_text(status, text)
+    except PlaywrightRequestError as e:
+        return False, f"Playwright 请求失败: {e}"
     except Exception as e:
         logger.error(f"CPA 上传异常: {e}")
         return False, f"上传异常: {str(e)}"

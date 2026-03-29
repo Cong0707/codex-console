@@ -28,6 +28,34 @@ running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
 
+# 注册执行方式
+AUTO_ACTION_DRIVERS = {"http", "playwright_edge", "playwright_chrome"}
+PLAYWRIGHT_CHANNEL_MAP = {
+    "playwright_edge": "msedge",
+    "playwright_chrome": "chrome",
+}
+AUTO_ACTION_DRIVER_LABELS = {
+    "http": "HTTP",
+    "playwright_edge": "Playwright-Edge",
+    "playwright_chrome": "Playwright-Chrome",
+}
+
+
+def normalize_auto_action_driver(value: Optional[str]) -> str:
+    driver = (value or "http").strip().lower()
+    if driver not in AUTO_ACTION_DRIVERS:
+        raise HTTPException(status_code=400, detail="注册执行方式无效")
+    return driver
+
+
+def coerce_auto_action_driver(value: Optional[str]) -> str:
+    driver = (value or "http").strip().lower()
+    return driver if driver in AUTO_ACTION_DRIVERS else "http"
+
+
+def resolve_playwright_channel(driver: str) -> Optional[str]:
+    return PLAYWRIGHT_CHANNEL_MAP.get(driver)
+
 
 # ============== Proxy Helper Functions ==============
 
@@ -71,6 +99,7 @@ class RegistrationTaskCreate(BaseModel):
     proxy: Optional[str] = None
     email_service_config: Optional[dict] = None
     email_service_id: Optional[int] = None
+    auto_action_driver: str = "http"
     auto_upload_cpa: bool = False
     cpa_service_ids: List[int] = []  # 指定 CPA 服务 ID 列表，空则取第一个启用的
     auto_upload_sub2api: bool = False
@@ -90,6 +119,7 @@ class BatchRegistrationRequest(BaseModel):
     interval_max: int = 30
     concurrency: int = 1
     mode: str = "pipeline"
+    auto_action_driver: str = "http"
     auto_upload_cpa: bool = False
     cpa_service_ids: List[int] = []
     auto_upload_sub2api: bool = False
@@ -158,6 +188,7 @@ class OutlookBatchRegistrationRequest(BaseModel):
     interval_max: int = 30
     concurrency: int = 1
     mode: str = "pipeline"
+    auto_action_driver: str = "http"
     auto_upload_cpa: bool = False
     cpa_service_ids: List[int] = []
     auto_upload_sub2api: bool = False
@@ -227,13 +258,14 @@ def _normalize_email_service_config(
     return normalized
 
 
-def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
+def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_action_driver: str = "http", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
     """
     在线程池中执行的同步注册任务
 
     这个函数会被 run_in_executor 调用，运行在独立线程中
     """
     with get_db() as db:
+        engine = None
         try:
             # 检查是否已取消
             if task_manager.is_cancelled(task_uuid):
@@ -430,11 +462,19 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             # 创建注册引擎 - 使用 TaskManager 的日志回调
             log_callback = task_manager.create_log_callback(task_uuid, prefix=log_prefix, batch_id=batch_id)
 
+            # 规范化注册执行方式
+            auto_action_driver = coerce_auto_action_driver(auto_action_driver)
+            driver_label = AUTO_ACTION_DRIVER_LABELS.get(auto_action_driver, "HTTP")
+            playwright_channel = resolve_playwright_channel(auto_action_driver)
+            log_callback(f"[系统] 注册执行方式: {driver_label}")
+
             engine = RegistrationEngine(
                 email_service=email_service,
                 proxy_url=actual_proxy_url,
                 callback_logger=log_callback,
-                task_uuid=task_uuid
+                task_uuid=task_uuid,
+                driver=auto_action_driver,
+                browser_channel=playwright_channel,
             )
 
             # 执行注册
@@ -603,9 +643,15 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 task_manager.update_status(task_uuid, "failed", error=str(e))
             except:
                 pass
+        finally:
+            try:
+                if engine and hasattr(engine, "http_client") and hasattr(engine.http_client, "close"):
+                    engine.http_client.close()
+            except Exception:
+                pass
 
 
-async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
+async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_action_driver: str = "http", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None):
     """
     异步执行注册任务
 
@@ -632,6 +678,7 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
             email_service_id,
             log_prefix,
             batch_id,
+            auto_action_driver,
             auto_upload_cpa,
             cpa_service_ids or [],
             auto_upload_sub2api,
@@ -684,6 +731,7 @@ async def run_batch_parallel(
     email_service_config: Optional[dict],
     email_service_id: Optional[int],
     concurrency: int,
+    auto_action_driver: str = "http",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -706,6 +754,7 @@ async def run_batch_parallel(
             await run_registration_task(
                 uuid, email_service_type, proxy, email_service_config, email_service_id,
                 log_prefix=prefix, batch_id=batch_id,
+                auto_action_driver=auto_action_driver,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
                 auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
@@ -750,6 +799,7 @@ async def run_batch_pipeline(
     interval_min: int,
     interval_max: int,
     concurrency: int,
+    auto_action_driver: str = "http",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -772,6 +822,7 @@ async def run_batch_pipeline(
             await run_registration_task(
                 uuid, email_service_type, proxy, email_service_config, email_service_id,
                 log_prefix=pfx, batch_id=batch_id,
+                auto_action_driver=auto_action_driver,
                 auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids or [],
                 auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids or [],
                 auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids or [],
@@ -840,6 +891,7 @@ async def run_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
+    auto_action_driver: str = "http",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -852,6 +904,7 @@ async def run_batch_registration(
         await run_batch_parallel(
             batch_id, task_uuids, email_service_type, proxy,
             email_service_config, email_service_id, concurrency,
+            auto_action_driver=auto_action_driver,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
@@ -861,6 +914,7 @@ async def run_batch_registration(
             batch_id, task_uuids, email_service_type, proxy,
             email_service_config, email_service_id,
             interval_min, interval_max, concurrency,
+            auto_action_driver=auto_action_driver,
             auto_upload_cpa=auto_upload_cpa, cpa_service_ids=cpa_service_ids,
             auto_upload_sub2api=auto_upload_sub2api, sub2api_service_ids=sub2api_service_ids,
             auto_upload_tm=auto_upload_tm, tm_service_ids=tm_service_ids,
@@ -890,6 +944,8 @@ async def start_registration(
             detail=f"无效的邮箱服务类型: {request.email_service_type}"
         )
 
+    auto_action_driver = normalize_auto_action_driver(request.auto_action_driver)
+
     # 创建任务
     task_uuid = str(uuid.uuid4())
 
@@ -910,6 +966,7 @@ async def start_registration(
         request.email_service_id,
         "",
         "",
+        auto_action_driver,
         request.auto_upload_cpa,
         request.cpa_service_ids,
         request.auto_upload_sub2api,
@@ -956,6 +1013,8 @@ async def start_batch_registration(
     if request.mode not in ("parallel", "pipeline"):
         raise HTTPException(status_code=400, detail="模式必须为 parallel 或 pipeline")
 
+    auto_action_driver = normalize_auto_action_driver(request.auto_action_driver)
+
     # 创建批量任务
     batch_id = str(uuid.uuid4())
     task_uuids = []
@@ -987,6 +1046,7 @@ async def start_batch_registration(
         request.interval_max,
         request.concurrency,
         request.mode,
+        auto_action_driver,
         request.auto_upload_cpa,
         request.cpa_service_ids,
         request.auto_upload_sub2api,
@@ -1475,6 +1535,7 @@ async def run_outlook_batch_registration(
     interval_max: int,
     concurrency: int = 1,
     mode: str = "pipeline",
+    auto_action_driver: str = "http",
     auto_upload_cpa: bool = False,
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
@@ -1518,6 +1579,7 @@ async def run_outlook_batch_registration(
         interval_max=interval_max,
         concurrency=concurrency,
         mode=mode,
+        auto_action_driver=auto_action_driver,
         auto_upload_cpa=auto_upload_cpa,
         cpa_service_ids=cpa_service_ids,
         auto_upload_sub2api=auto_upload_sub2api,
@@ -1556,6 +1618,8 @@ async def start_outlook_batch_registration(
 
     if request.mode not in ("parallel", "pipeline"):
         raise HTTPException(status_code=400, detail="模式必须为 parallel 或 pipeline")
+
+    auto_action_driver = normalize_auto_action_driver(request.auto_action_driver)
 
     # 过滤掉已注册的邮箱
     actual_service_ids = request.service_ids
@@ -1622,6 +1686,7 @@ async def start_outlook_batch_registration(
         request.interval_max,
         request.concurrency,
         request.mode,
+        auto_action_driver,
         request.auto_upload_cpa,
         request.cpa_service_ids,
         request.auto_upload_sub2api,

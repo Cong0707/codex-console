@@ -12,6 +12,7 @@ from curl_cffi import requests as cffi_requests
 
 from ...database.session import get_db
 from ...database.models import Account
+from .playwright_request import PlaywrightRequestError, playwright_request
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,115 @@ def upload_to_sub2api(
             error_msg = f"{error_msg} - {response.text[:200]}"
         return False, error_msg
 
+    except Exception as e:
+        logger.error(f"Sub2API 上传异常: {e}")
+        return False, f"上传异常: {str(e)}"
+
+
+def upload_to_sub2api_playwright(
+    accounts: List[Account],
+    api_url: str,
+    api_key: str,
+    concurrency: int = 3,
+    priority: int = 50,
+    target_type: str = "sub2api",
+    browser_channel: str = "chrome",
+) -> Tuple[bool, str]:
+    """
+    上传账号列表到 Sub2API 平台（Playwright + 系统浏览器）。
+    """
+    if not accounts:
+        return False, "无可上传的账号"
+    if not api_url:
+        return False, "Sub2API URL 未配置"
+    if not api_key:
+        return False, "Sub2API API Key 未配置"
+
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    account_items = []
+    for acc in accounts:
+        if not acc.access_token:
+            continue
+        expires_at = int(acc.expires_at.timestamp()) if acc.expires_at else 0
+        account_items.append({
+            "name": acc.email,
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {
+                "access_token": acc.access_token,
+                "chatgpt_account_id": acc.account_id or "",
+                "chatgpt_user_id": "",
+                "client_id": acc.client_id or "",
+                "expires_at": expires_at,
+                "expires_in": 863999,
+                "model_mapping": {
+                    "gpt-5.1": "gpt-5.1",
+                    "gpt-5.1-codex": "gpt-5.1-codex",
+                    "gpt-5.1-codex-max": "gpt-5.1-codex-max",
+                    "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
+                    "gpt-5.2": "gpt-5.2",
+                    "gpt-5.2-codex": "gpt-5.2-codex",
+                    "gpt-5.3": "gpt-5.3",
+                    "gpt-5.3-codex": "gpt-5.3-codex",
+                    "gpt-5.4": "gpt-5.4"
+                },
+                "organization_id": acc.workspace_id or "",
+                "refresh_token": acc.refresh_token or "",
+            },
+            "extra": {},
+            "concurrency": concurrency,
+            "priority": priority,
+            "rate_multiplier": 1,
+            "auto_pause_on_expired": True,
+        })
+
+    if not account_items:
+        return False, "所有账号均缺少 access_token，无法上传"
+
+    payload = {
+        "data": {
+            "type": "newapi-data" if str(target_type).lower() == "newapi" else "sub2api-data",
+            "version": 1,
+            "exported_at": exported_at,
+            "proxies": [],
+            "accounts": account_items,
+        },
+        "skip_default_group_bind": True,
+    }
+
+    url = api_url.rstrip("/") + "/api/v1/admin/accounts/data"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "Idempotency-Key": f"import-{exported_at}",
+    }
+
+    try:
+        status, text = playwright_request(
+            "POST",
+            url,
+            headers=headers,
+            json_data=payload,
+            browser_channel=browser_channel,
+            headless=False,
+            timeout=30,
+        )
+        if status in (200, 201):
+            return True, f"成功上传 {len(account_items)} 个账号"
+
+        error_msg = f"上传失败: HTTP {status}"
+        try:
+            detail = json.loads(text or "")
+            if isinstance(detail, dict):
+                error_msg = detail.get("message", error_msg)
+        except Exception:
+            snippet = (text or "").strip()
+            if snippet:
+                error_msg = f"{error_msg} - {snippet[:200]}"
+        return False, error_msg
+    except PlaywrightRequestError as e:
+        return False, f"Playwright 请求失败: {e}"
     except Exception as e:
         logger.error(f"Sub2API 上传异常: {e}")
         return False, f"上传异常: {str(e)}"

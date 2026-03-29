@@ -3,6 +3,7 @@ Team Manager 上传功能
 参照 CPA 上传模式，直连不走代理
 """
 
+import json
 import logging
 from typing import List, Tuple
 
@@ -10,6 +11,7 @@ from curl_cffi import requests as cffi_requests
 
 from ...database.models import Account
 from ...database.session import get_db
+from .playwright_request import PlaywrightRequestError, playwright_request
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,67 @@ def upload_to_team_manager(
         except Exception:
             error_msg = f"{error_msg} - {resp.text[:200]}"
         return False, error_msg
+    except Exception as e:
+        logger.error(f"Team Manager 上传异常: {e}")
+        return False, f"上传异常: {str(e)}"
+
+
+def upload_to_team_manager_playwright(
+    account: Account,
+    api_url: str,
+    api_key: str,
+    browser_channel: str = "chrome",
+) -> Tuple[bool, str]:
+    """
+    上传单账号到 Team Manager（Playwright + 系统浏览器）。
+    """
+    if not api_url:
+        return False, "Team Manager API URL 未配置"
+    if not api_key:
+        return False, "Team Manager API Key 未配置"
+    if not account.access_token:
+        return False, "账号缺少 access_token"
+
+    url = api_url.rstrip("/") + "/admin/teams/import"
+    headers = {
+        "X-API-Key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "import_type": "single",
+        "email": account.email,
+        "access_token": account.access_token or "",
+        "session_token": account.session_token or "",
+        "refresh_token": account.refresh_token or "",
+        "client_id": account.client_id or "",
+        "account_id": account.account_id or "",
+    }
+
+    try:
+        status, text = playwright_request(
+            "POST",
+            url,
+            headers=headers,
+            json_data=payload,
+            browser_channel=browser_channel,
+            headless=False,
+            timeout=30,
+        )
+        if status in (200, 201):
+            return True, "上传成功"
+
+        error_msg = f"上传失败: HTTP {status}"
+        try:
+            detail = json.loads(text or "")
+            if isinstance(detail, dict):
+                error_msg = detail.get("message", error_msg)
+        except Exception:
+            snippet = (text or "").strip()
+            if snippet:
+                error_msg = f"{error_msg} - {snippet[:200]}"
+        return False, error_msg
+    except PlaywrightRequestError as e:
+        return False, f"Playwright 请求失败: {e}"
     except Exception as e:
         logger.error(f"Team Manager 上传异常: {e}")
         return False, f"上传异常: {str(e)}"

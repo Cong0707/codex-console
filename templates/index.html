@@ -403,6 +403,16 @@
                                     </div>
                                 </div>
 
+                                <div class="form-group" id="registration-driver-group">
+                                    <label for="auto-action-driver">注册执行方式</label>
+                                    <select id="auto-action-driver" name="auto_action_driver">
+                                        <option value="http">HTTP 请求（默认）</option>
+                                        <option value="playwright_edge">Playwright - 有头 Edge</option>
+                                        <option value="playwright_chrome">Playwright - 有头 Chrome</option>
+                                    </select>
+                                    <small style="color: var(--text-muted); font-size: 0.75rem;">使用 Playwright 会在本机打开浏览器执行注册流程</small>
+                                </div>
+
                                 <div class="form-group" id="auto-upload-group">
                                     <label style="font-weight: 500; margin-bottom: var(--spacing-xs); display: block;">注册后自动操作</label>
 

@@ -101,7 +101,9 @@ class RegistrationEngine:
         email_service: BaseEmailService,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        task_uuid: Optional[str] = None,
+        driver: str = "http",
+        browser_channel: Optional[str] = None,
     ):
         """
         初始化注册引擎
@@ -111,14 +113,29 @@ class RegistrationEngine:
             proxy_url: 代理 URL
             callback_logger: 日志回调函数
             task_uuid: 任务 UUID（用于数据库记录）
+            driver: 注册请求驱动（http/playwright_edge/playwright_chrome）
+            browser_channel: Playwright 浏览器通道（chrome/msedge）
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        self.driver = (driver or "http").strip().lower()
+        self.browser_channel = browser_channel
 
         # 创建 HTTP 客户端
-        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        if self.driver in {"playwright_edge", "playwright_chrome"}:
+            try:
+                from .playwright_http_client import PlaywrightOpenAIClient
+            except Exception as exc:
+                raise RuntimeError(f"Playwright 初始化失败: {exc}") from exc
+            self.http_client = PlaywrightOpenAIClient(
+                proxy_url=proxy_url,
+                browser_channel=self.browser_channel or "chrome",
+                headless=False,
+            )
+        else:
+            self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
 
         # 创建 OAuth 管理器
         settings = get_settings()
@@ -403,6 +420,12 @@ class RegistrationEngine:
         try:
             self._log("开始 OAuth 授权流程，去门口刷个脸...")
             self.oauth_start = self.oauth_manager.start_oauth()
+            if hasattr(self.http_client, "open_browser_url") and self.oauth_start and self.oauth_start.auth_url:
+                try:
+                    self.http_client.open_browser_url(self.oauth_start.auth_url)
+                    self._log("已打开浏览器窗口，注册流程在前台可见")
+                except Exception as open_err:
+                    self._log(f"打开浏览器窗口失败: {open_err}", "warning")
             self._log(f"OAuth URL 已备好，通道已经打开: {self.oauth_start.auth_url[:80]}...")
             return True
         except Exception as e:
@@ -2899,6 +2922,621 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
+    def _get_playwright_page(self):
+        """Get the Playwright page for UI automation."""
+        try:
+            if not self.session:
+                self._init_session()
+            if not self.session:
+                return None
+            page = getattr(self.session, "page", None)
+            if page:
+                try:
+                    page.set_default_timeout(30000)
+                except Exception:
+                    pass
+            return page
+        except Exception as e:
+            self._log(f"初始化 Playwright 页面失败: {e}", "error")
+            return None
+
+    def _pw_wait_any(self, page, selectors: List[str], timeout: int = 30000):
+        """Wait until any selector becomes visible and return locator."""
+        if not page:
+            return None
+        deadline = time.time() + (timeout / 1000.0)
+        last_error = None
+        while time.time() < deadline:
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector).first
+                    if locator and locator.is_visible():
+                        return locator
+                except Exception as e:
+                    last_error = e
+            try:
+                page.wait_for_timeout(300)
+            except Exception as e:
+                last_error = e
+                break
+        if last_error:
+            self._log(f"Playwright 等待元素超时: {last_error}", "warning")
+        return None
+
+    def _pw_log_state(self, page, stage: str):
+        """Log current page state for debugging."""
+        if not page:
+            return
+        try:
+            url = str(page.url or "")
+        except Exception:
+            url = ""
+        try:
+            title = str(page.title() or "")
+        except Exception:
+            title = ""
+        self._log(f"Playwright 页面状态({stage}): url={url[:160]} title={title[:80]}")
+
+    def _pw_wait_for_auth_form(self, page, timeout: int = 90000) -> Optional[str]:
+        """Wait for auth form (email/password) to appear."""
+        if not page:
+            return None
+        deadline = time.time() + (timeout / 1000.0)
+        email_selectors = [
+            "input#username",
+            "input[name='username']",
+            "input[name='email']",
+            "input[type='email']",
+            "input[autocomplete='email']",
+            "input[autocomplete='username']",
+        ]
+        password_selectors = [
+            "input[type='password']",
+            "input[name='password']",
+        ]
+
+        while time.time() < deadline:
+            if self._pw_is_cloudflare(page):
+                self._pw_handle_cloudflare(page, timeout=15000)
+
+            try:
+                url = str(page.url or "")
+            except Exception:
+                url = ""
+            try:
+                title = str(page.title() or "")
+            except Exception:
+                title = ""
+
+            if "请稍候" in title or "/api/oauth/oauth2/auth" in url:
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+                continue
+
+            if self._pw_wait_any(page, email_selectors, timeout=1500):
+                return "email"
+            if self._pw_wait_any(page, password_selectors, timeout=1500):
+                return "password"
+
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                break
+
+        self._pw_log_state(page, "auth_form_timeout")
+        return None
+
+    def _pw_is_cloudflare(self, page) -> bool:
+        if not page:
+            return False
+        try:
+            url = str(page.url or "")
+            if "challenges.cloudflare.com" in url or "cdn-cgi/challenge" in url:
+                return True
+        except Exception:
+            pass
+        try:
+            if page.locator("text=Just a moment").count() > 0:
+                return True
+            if page.locator("text=Checking your browser").count() > 0:
+                return True
+            if page.locator("iframe[src*='turnstile']").count() > 0:
+                return True
+            if page.locator("iframe[src*='hcaptcha']").count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _pw_handle_cloudflare(self, page, timeout: int = 90000) -> bool:
+        """Wait for Cloudflare challenge to pass and try to click checkbox if present."""
+        if not page:
+            return False
+        if not self._pw_is_cloudflare(page):
+            return True
+        self._log("检测到 Cloudflare 验证页，等待验证通过...")
+        self._pw_log_state(page, "cf_detected")
+        deadline = time.time() + (timeout / 1000.0)
+        while time.time() < deadline:
+            if not self._pw_is_cloudflare(page):
+                self._log("Cloudflare 验证已通过")
+                return True
+            try:
+                for frame in page.frames:
+                    frame_url = str(getattr(frame, "url", "") or "")
+                    if "turnstile" in frame_url or "challenges.cloudflare.com" in frame_url or "hcaptcha" in frame_url:
+                        try:
+                            checkbox = frame.locator("input[type='checkbox']").first
+                            if checkbox and checkbox.is_visible():
+                                checkbox.click()
+                                self._log("已尝试点击 Cloudflare 验证框")
+                        except Exception:
+                            pass
+                        try:
+                            btn = frame.locator("button").first
+                            if btn and btn.is_visible():
+                                btn.click()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                break
+        self._log("Cloudflare 验证等待超时", "warning")
+        return False
+
+    def _pw_click(self, page, selectors: List[str], label: str, timeout: int = 30000) -> bool:
+        locator = self._pw_wait_any(page, selectors, timeout=timeout)
+        if not locator:
+            self._log(f"Playwright 未找到可点击元素: {label}", "warning")
+            return False
+        try:
+            locator.click()
+            return True
+        except Exception as e:
+            self._log(f"Playwright 点击失败({label}): {e}", "warning")
+            return False
+
+    def _pw_fill(self, page, selectors: List[str], value: str, label: str, timeout: int = 30000) -> bool:
+        locator = self._pw_wait_any(page, selectors, timeout=timeout)
+        if not locator:
+            self._log(f"Playwright 未找到输入框: {label}", "warning")
+            return False
+        try:
+            locator.fill(value or "")
+            return True
+        except Exception as e:
+            try:
+                locator.click()
+                page.keyboard.type(value or "", delay=30)
+                return True
+            except Exception:
+                self._log(f"Playwright 填充失败({label}): {e}", "warning")
+                return False
+
+    def _pw_submit(self, page, selectors: List[str], label: str, timeout: int = 20000) -> bool:
+        if self._pw_click(page, selectors, label, timeout=timeout):
+            return True
+        try:
+            if page:
+                page.keyboard.press("Enter")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _pw_has_text(self, page, keywords: List[str]) -> Optional[str]:
+        if not page:
+            return None
+        for key in keywords:
+            try:
+                if page.locator(f"text={key}").count() > 0:
+                    return key
+            except Exception:
+                continue
+        return None
+
+    def _pw_fill_otp(self, page, code: str) -> bool:
+        if not page:
+            return False
+        code = re.sub(r"\D", "", str(code or ""))
+        if not code:
+            return False
+
+        try:
+            inputs = page.locator(
+                "input[autocomplete='one-time-code'], input[inputmode='numeric'], input[type='tel'], input[name='code']"
+            )
+            count = inputs.count()
+            if count >= 6:
+                for idx, ch in enumerate(code[:count]):
+                    try:
+                        inputs.nth(idx).fill(ch)
+                    except Exception:
+                        pass
+                return True
+            if count > 0:
+                inputs.first.fill(code)
+                return True
+        except Exception:
+            pass
+
+        return self._pw_fill(
+            page,
+            ["input[name='code']", "input[name='otp']", "input[name='verification_code']"],
+            code,
+            "验证码输入框",
+            timeout=10000,
+        )
+
+    def _pw_fill_about_you(self, page) -> bool:
+        if not page:
+            return False
+        try:
+            user_info = generate_random_user_info()
+            first_name = str(user_info.get("first_name") or "Ethan")
+            last_name = str(user_info.get("last_name") or "")
+            birthdate = str(user_info.get("birthdate") or "2000-01-01")
+
+            name_filled = False
+            # Full name or first name
+            if self._pw_fill(
+                page,
+                [
+                    "input[name='first_name']",
+                    "input[autocomplete='given-name']",
+                    "input[placeholder*='First']",
+                    "input[placeholder*='名字']",
+                ],
+                first_name,
+                "名字",
+                timeout=8000,
+            ):
+                name_filled = True
+            if last_name:
+                self._pw_fill(
+                    page,
+                    [
+                        "input[name='last_name']",
+                        "input[autocomplete='family-name']",
+                        "input[placeholder*='Last']",
+                        "input[placeholder*='姓']",
+                    ],
+                    last_name,
+                    "姓氏",
+                    timeout=4000,
+                )
+            if not name_filled:
+                full_name = f"{first_name} {last_name}".strip()
+                self._pw_fill(
+                    page,
+                    [
+                        "input[name='name']",
+                        "input[autocomplete='name']",
+                        "input[placeholder*='name']",
+                        "input[placeholder*='姓名']",
+                    ],
+                    full_name,
+                    "姓名",
+                    timeout=4000,
+                )
+
+            # Birthdate handling
+            try:
+                date_input = page.locator("input[type='date']").first
+                if date_input and date_input.is_visible():
+                    date_input.fill(birthdate)
+                    return True
+            except Exception:
+                pass
+
+            try:
+                month_sel = page.locator("select[name*='month']").first
+                day_sel = page.locator("select[name*='day']").first
+                year_sel = page.locator("select[name*='year']").first
+                if month_sel and day_sel and year_sel and month_sel.is_visible():
+                    y, m, d = birthdate.split("-")
+                    month_sel.select_option(str(int(m)))
+                    day_sel.select_option(str(int(d)))
+                    year_sel.select_option(str(int(y)))
+                    return True
+            except Exception:
+                pass
+
+            try:
+                y, m, d = birthdate.split("-")
+                mm_input = page.locator("input[placeholder='MM']").first
+                dd_input = page.locator("input[placeholder='DD']").first
+                yy_input = page.locator("input[placeholder='YYYY']").first
+                if mm_input and dd_input and yy_input and mm_input.is_visible():
+                    mm_input.fill(str(int(m)).zfill(2))
+                    dd_input.fill(str(int(d)).zfill(2))
+                    yy_input.fill(str(int(y)))
+                    return True
+            except Exception:
+                pass
+
+            # 可能需要选择用途（个人/工作/学习）
+            self._pw_click(
+                page,
+                [
+                    "button:has-text('Personal')",
+                    "button:has-text('Work')",
+                    "button:has-text('Student')",
+                    "button:has-text('个人')",
+                    "button:has-text('工作')",
+                    "button:has-text('学习')",
+                    "button[role='radio']",
+                    "div[role='radio']",
+                ],
+                "用途选择",
+                timeout=2000,
+            )
+
+            return True
+        except Exception as e:
+            self._log(f"填写资料页失败: {e}", "warning")
+            return False
+
+    def _run_playwright_ui(self) -> RegistrationResult:
+        """Run full UI-driven registration with Playwright."""
+        result = RegistrationResult(success=False, logs=self.logs)
+        try:
+            self._log("=" * 60)
+            self._log("Playwright 有头注册流程启动")
+            self._log("=" * 60)
+
+            self._is_existing_account = False
+            self._token_acquisition_requires_login = False
+
+            # 1) Create email
+            self._log("2. 开个新邮箱，准备收信...")
+            if not self._create_email():
+                result.error_message = "创建邮箱失败"
+                return result
+            result.email = self.email
+
+            # 2) Prepare OAuth URL and browser
+            self._init_session()
+            if not self._start_oauth():
+                result.error_message = "生成 OAuth URL 失败"
+                return result
+
+            page = self._get_playwright_page()
+            if not page:
+                result.error_message = "Playwright 页面初始化失败"
+                return result
+
+            if self.oauth_start and self.oauth_start.auth_url:
+                try:
+                    page.goto(self.oauth_start.auth_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception as nav_err:
+                    self._log(f"打开 OAuth 页面失败: {nav_err}", "warning")
+            self._pw_handle_cloudflare(page)
+            self._pw_wait_for_auth_form(page, timeout=120000)
+
+            # Ensure signup mode if possible
+            self._pw_click(
+                page,
+                ["text=Sign up", "text=注册", "text=创建账号", "button:has-text('Sign up')"],
+                "切换注册模式",
+                timeout=3000,
+            )
+
+            # 3) Fill email
+            self._log("4. 递上邮箱，看看 OpenAI 这球怎么接...")
+            self._pw_handle_cloudflare(page)
+            email_ok = self._pw_fill(
+                page,
+                [
+                    "input#username",
+                    "input[type='email']",
+                    "input[name='username']",
+                    "input[name='email']",
+                    "input[autocomplete='email']",
+                    "input[autocomplete='username']",
+                ],
+                self.email,
+                "邮箱输入框",
+                timeout=20000,
+            )
+            if not email_ok:
+                self._pw_log_state(page, "email_input_missing")
+                result.error_message = "未找到邮箱输入框"
+                return result
+
+            self._pw_submit(
+                page,
+                ["button[type='submit']", "button:has-text('Continue')", "button:has-text('Next')", "button:has-text('继续')"],
+                "邮箱提交",
+                timeout=15000,
+            )
+
+            # Check for existing account
+            exists_text = self._pw_has_text(
+                page,
+                [
+                    "already exists",
+                    "already registered",
+                    "账户已存在",
+                    "该邮箱已注册",
+                    "已注册",
+                ],
+            )
+            if exists_text:
+                result.error_message = "该邮箱已注册，无法继续注册"
+                self._log(f"注册页面提示: {exists_text}", "warning")
+                return result
+
+            # 4) Set password
+            self._log("5. 设置密码，别让小偷偷笑...")
+            self.password = self._generate_password()
+            result.password = self.password
+            self._pw_handle_cloudflare(page)
+            pwd_ok = self._pw_fill(
+                page,
+                ["input[type='password']", "input[name='password']"],
+                self.password,
+                "密码输入框",
+                timeout=20000,
+            )
+            if not pwd_ok:
+                self._pw_log_state(page, "password_input_missing")
+                result.error_message = "未找到密码输入框"
+                return result
+
+            # Optional confirm password
+            self._pw_fill(
+                page,
+                ["input[name='confirm_password']", "input[name='passwordConfirm']"],
+                self.password,
+                "确认密码",
+                timeout=3000,
+            )
+
+            self._pw_submit(
+                page,
+                ["button[type='submit']", "button:has-text('Continue')", "button:has-text('Next')", "button:has-text('继续')"],
+                "提交密码",
+                timeout=15000,
+            )
+
+            # 5) OTP
+            self._log("6. 催一下注册验证码出门，邮差该冲刺了...")
+            self._otp_sent_at = time.time()
+            # Wait for OTP input to appear
+            self._pw_wait_any(
+                page,
+                [
+                    "input[autocomplete='one-time-code']",
+                    "input[inputmode='numeric']",
+                    "input[type='tel']",
+                    "input[name='code']",
+                ],
+                timeout=60000,
+            )
+
+            self._log("7. 等验证码飞来，邮箱请注意查收...")
+            code = self._get_verification_code(timeout=180)
+            if not code:
+                result.error_message = "获取验证码失败"
+                return result
+
+            self._log("8. 对一下验证码，看看是不是本人...")
+            if not self._pw_fill_otp(page, code):
+                self._pw_log_state(page, "otp_fill_failed")
+                result.error_message = "验证码填写失败"
+                return result
+
+            self._pw_submit(
+                page,
+                [
+                    "button[type='submit']",
+                    "button:has-text('Continue')",
+                    "button:has-text('Verify')",
+                    "button:has-text('Next')",
+                    "button:has-text('继续')",
+                    "button:has-text('验证')",
+                ],
+                "验证码提交",
+                timeout=15000,
+            )
+
+            # 6) About you / profile
+            self._log("9. 给账号办个正式户口，名字写档案里...")
+            self._pw_handle_cloudflare(page)
+            self._pw_fill_about_you(page)
+            self._pw_submit(
+                page,
+                ["button[type='submit']", "button:has-text('Continue')", "button:has-text('Next')", "button:has-text('继续')"],
+                "资料提交",
+                timeout=10000,
+            )
+
+            # Try to proceed to ChatGPT home
+            self._pw_submit(
+                page,
+                [
+                    "button:has-text('Continue to ChatGPT')",
+                    "button:has-text('Go to ChatGPT')",
+                    "a:has-text('Continue to ChatGPT')",
+                    "a:has-text('Go to ChatGPT')",
+                ],
+                "进入 ChatGPT",
+                timeout=5000,
+            )
+
+            # Detect disallowed or phone gate
+            if "add-phone" in (page.url or ""):
+                result.error_message = "命中手机号验证页面，无法自动完成"
+                return result
+
+            disallowed_text = self._pw_has_text(
+                page,
+                [
+                    "registration_disallowed",
+                    "cannot create your account",
+                    "we cannot create your account",
+                    "无法创建账号",
+                    "注册被禁止",
+                ],
+            )
+            if disallowed_text:
+                result.error_message = "创建用户账户失败"
+                self._log(f"注册页面提示: {disallowed_text}", "warning")
+                return result
+
+            # Ensure we land on chatgpt.com for cookies
+            try:
+                page.wait_for_url("**chatgpt.com/**", timeout=30000)
+            except Exception:
+                try:
+                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                except Exception as nav_err:
+                    self._log(f"进入 ChatGPT 首页失败: {nav_err}", "warning")
+
+            # 7) Capture tokens/cookies
+            self._capture_auth_session_tokens(result)
+
+            # Fill device id if possible
+            if not result.device_id:
+                try:
+                    result.device_id = str(self.session.cookies.get("oai-did") or "").strip()
+                except Exception:
+                    result.device_id = ""
+
+            result.success = True
+
+            settings = get_settings()
+            client_id = str(getattr(settings, "openai_client_id", "") or getattr(self.oauth_manager, "client_id", "") or "").strip()
+            result.metadata = {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now().isoformat(),
+                "is_existing_account": self._is_existing_account,
+                "token_acquired_via_relogin": self._token_acquisition_requires_login,
+                "client_id": client_id,
+                "device_id": result.device_id,
+                "has_session_token": bool(result.session_token),
+                "has_access_token": bool(result.access_token),
+                "has_refresh_token": bool(result.refresh_token),
+                "registration_entry_flow": self.registration_entry_flow,
+                "registration_entry_flow_effective": self.registration_entry_flow,
+                "session_token_pending": self.registration_entry_flow == "native" and (not bool(result.session_token)),
+            }
+
+            self._log("注册成功，账号已经稳稳落地，可以开香槟了")
+            return result
+
+        except Exception as e:
+            self._log(f"Playwright 注册流程异常: {e}", "error")
+            result.error_message = str(e)
+            return result
+
     def run(self) -> RegistrationResult:
         """
         执行完整的注册流程
@@ -2912,6 +3550,9 @@ class RegistrationEngine:
             RegistrationResult: 注册结果
         """
         result = RegistrationResult(success=False, logs=self.logs)
+
+        if self.driver in {"playwright_edge", "playwright_chrome"}:
+            return self._run_playwright_ui()
 
         try:
             token_ready = False
@@ -2939,15 +3580,15 @@ class RegistrationEngine:
                 self._log("检测到 Outlook 邮箱，自动使用 Outlook 入口链路（无需在设置中选择）")
                 effective_entry_flow = "outlook"
 
-            # 1. 检查 IP 地理位置
-            self._log("1. 先看看这条网络从哪儿来，别一开局就站错片场...")
-            ip_ok, location = self._check_ip_location()
-            if not ip_ok:
-                result.error_message = f"IP 地理位置不支持: {location}"
-                self._log(f"IP 检查失败: {location}", "error")
-                return result
-
-            self._log(f"IP 位置: {location}")
+            # # 1. 检查 IP 地理位置
+            # self._log("1. 先看看这条网络从哪儿来，别一开局就站错片场...")
+            # ip_ok, location = self._check_ip_location()
+            # if not ip_ok:
+            #     result.error_message = f"IP 地理位置不支持: {location}"
+            #     self._log(f"IP 检查失败: {location}", "error")
+            #     return result
+            #
+            # self._log(f"IP 位置: {location}")
 
             # 2. 创建邮箱
             self._log("2. 开个新邮箱，准备收信...")
