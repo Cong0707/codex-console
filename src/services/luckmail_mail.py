@@ -18,6 +18,8 @@ from ..config.constants import OTP_CODE_PATTERN
 
 logger = logging.getLogger(__name__)
 _STATE_LOCK = threading.RLock()
+# 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
+LUCKMAIL_APPEAL_ENABLED = False
 
 
 def _load_luckmail_client_class():
@@ -321,15 +323,61 @@ class LuckMailService(BaseEmailService):
         self._save_email_index(self._registered_file, registered)
         self._save_email_index(self._failed_file, failed)
 
-    def _mark_failed_email(self, email: str, reason: str = "", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _should_force_failed_record(self, reason: str) -> bool:
+        text = str(reason or "").strip().lower()
+        if not text:
+            return False
+        keywords = (
+            "该邮箱已存在 openai",
+            "邮箱已存在 openai",
+            "user_already_exists",
+            "already exists",
+            "failed to register username",
+            "用户名注册失败",
+            "创建用户账户失败",
+        )
+        return any(k in text for k in keywords)
+
+    def _reconcile_failed_over_registered(
+        self,
+        registered: Dict[str, Dict[str, Any]],
+        failed: Dict[str, Dict[str, Any]],
+    ) -> bool:
+        changed = False
+        for email, failed_meta in list(failed.items()):
+            if email not in registered:
+                continue
+            failed_reason = str((failed_meta or {}).get("reason") or "")
+            if self._should_force_failed_record(failed_reason):
+                registered.pop(email, None)
+                changed = True
+        return changed
+
+    def _mark_failed_email(
+        self,
+        email: str,
+        reason: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+        prefer_failed: bool = False,
+    ) -> Dict[str, Any]:
         email_norm = self._normalize_email(email)
         if not email_norm:
             return {}
+
         registered = self._load_email_index(self._registered_file)
+        registered_record: Dict[str, Any] = {}
         if email_norm in registered:
-            return registered.get(email_norm) or {}
+            if not prefer_failed:
+                return registered.get(email_norm) or {}
+            registered_record = dict(registered.get(email_norm) or {})
+            registered.pop(email_norm, None)
+            self._save_email_index(self._registered_file, registered)
+
         failed = self._load_email_index(self._failed_file)
         record = failed.get(email_norm, {"email": email_norm, "fail_count": 0})
+        for k, v in registered_record.items():
+            if k not in record and v not in (None, ""):
+                record[k] = v
         record["fail_count"] = int(record.get("fail_count") or 0) + 1
         record["updated_at"] = self._now_iso()
         if reason:
@@ -353,11 +401,17 @@ class LuckMailService(BaseEmailService):
         if success:
             self._mark_registered_email(email, extra=context)
         else:
+            prefer_failed = self._should_force_failed_record(reason)
             context_copy = dict(context or {})
             password = str(context_copy.get("generated_password") or context_copy.get("password") or "").strip()
             if password:
                 context_copy["password"] = password
-            record = self._mark_failed_email(email, reason=reason, extra=context_copy)
+            record = self._mark_failed_email(
+                email,
+                reason=reason,
+                extra=context_copy,
+                prefer_failed=prefer_failed,
+            )
             self._try_submit_appeal(email=email, reason=reason, context=context_copy, failed_record=record)
 
     def _resolve_order_id_by_order_no(self, order_no: str, max_pages: int = 3, page_size: int = 50) -> Optional[int]:
@@ -453,6 +507,9 @@ class LuckMailService(BaseEmailService):
         context: Dict[str, Any],
         failed_record: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if not LUCKMAIL_APPEAL_ENABLED:
+            return
+
         reason_text = str(reason or "").strip()
         if not reason_text:
             return
@@ -463,6 +520,8 @@ class LuckMailService(BaseEmailService):
             or "限流" in reason_text
             or "验证码" in reason_text
             or "otp" in reason_lower
+            or "failed to register username" in reason_lower
+            or "用户名注册失败" in reason_text
             or "创建用户账户失败" in reason_text
             or "该邮箱已存在 openai" in reason_lower
             or "user_already_exists" in reason_lower
@@ -606,6 +665,8 @@ class LuckMailService(BaseEmailService):
     ) -> Optional[Dict[str, Any]]:
         registered = self._load_email_index(self._registered_file)
         failed = self._load_email_index(self._failed_file)
+        if self._reconcile_failed_over_registered(registered, failed):
+            self._save_email_index(self._registered_file, registered)
 
         candidates: List[Dict[str, Any]] = []
         for item in self._iter_purchase_items(
